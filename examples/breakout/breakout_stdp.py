@@ -43,7 +43,7 @@ network.add_connection(inpt_middle, source="Input Layer", target="Hidden Layer")
 network.add_connection(middle_out, source="Hidden Layer", target="Output Layer")
 
 # Environment (nếu chạy SSH/không GUI thì để render_mode=None)
-environment = GymEnvironment("BreakoutDeterministic-v4", render_mode=None)
+environment = GymEnvironment("BreakoutDeterministic-v4", render_mode="rgb_array")
 environment.reset()
 
 environment_pipeline = EnvironmentPipeline(
@@ -55,8 +55,8 @@ environment_pipeline = EnvironmentPipeline(
     time=100,
     history_length=1,
     delta=1,
-    plot_interval=1,
-    render_interval=1,
+    plot_interval=None,
+    render_interval=None,
 )
 
 # ----------------- CHECKPOINT -----------------
