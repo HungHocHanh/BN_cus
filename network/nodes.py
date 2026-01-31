@@ -415,6 +415,182 @@ class IFNodes(Nodes):
         self.refrac_count = torch.zeros_like(self.v, device=self.refrac_count.device)
 
 
+class IzhikevichHominNodes(Nodes):
+    # language=rst
+    """
+    Layer of `Izhikevich neurons<https://www.izhikevich.org/publications/spikes.htm>`_.
+    """
+    TYPE_PRESETS = {
+        "RS":  {"d": 6},
+        "IB":  {"d": 4},
+        "CH":  {"d": 0.5},
+        "LTS": {"d": 0.375},
+    }
+
+    def __init__(
+        self,
+        n: Optional[int] = None,
+        shape: Optional[Iterable[int]] = None,
+        traces: bool = False,
+        traces_additive: bool = False,
+        tc_trace: Union[float, torch.Tensor] = 20.0,
+        trace_scale: Union[float, torch.Tensor] = 1.0,
+        sum_input: bool = False,
+        excitatory: float = 1.0,
+        thresh: Union[float, torch.Tensor] = 4.5,   # scaled ~ 45mV
+        rest:   Union[float, torch.Tensor] = -6.5,  # scaled ~ -65mV
+        type_ex: str = "RS",   
+        type_in: str = "RS",                        
+        lbound: float = None,
+        **kwargs,
+    ) -> None:
+        # language=rst
+        """
+        Instantiates a layer of Izhikevich neurons.
+
+        :param n: The number of neurons in the layer.
+        :param shape: The dimensionality of the layer.
+        :param traces: Whether to record spike traces.
+        :param traces_additive: Whether to record spike traces additively.
+        :param tc_trace: Time constant of spike trace decay.
+        :param trace_scale: Scaling factor for spike trace.
+        :param sum_input: Whether to sum all inputs.
+        :param excitatory: Percent of excitatory (vs. inhibitory) neurons in the layer; in range ``[0, 1]``.
+        :param thresh: Spike threshold voltage.
+        :param rest: Resting membrane voltage.
+        :param lbound: Lower bound of the voltage.
+        """
+        super().__init__(
+            n=n,
+            shape=shape,
+            traces=traces,
+            traces_additive=traces_additive,
+            tc_trace=tc_trace,
+            trace_scale=trace_scale,
+            sum_input=sum_input,
+        )
+
+        self.register_buffer("rest", torch.tensor(rest))  # Rest voltage.
+        self.register_buffer("thresh", torch.tensor(thresh))  # Spike threshold voltage.
+        self.lbound = lbound
+
+# --- Setup c and d ---
+        tkey_ex = str(type_ex).upper()
+        if tkey_ex not in self.TYPE_PRESETS:
+            tkey_ex = "RS"
+
+        tkey_in = str(type_in).upper()
+        if tkey_in not in self.TYPE_PRESETS:
+            tkey_in = "RS"
+
+        d_preset_ex = self.TYPE_PRESETS[tkey_ex]["d"]
+        d_preset_in = self.TYPE_PRESETS[tkey_in]["d"]
+
+        # self.register_buffer("r", None)
+        self.register_buffer("a", None)
+        self.register_buffer("b", None)
+        self.register_buffer("c", None)
+        self.register_buffer("d", None)
+        self.register_buffer("S", None)
+        self.register_buffer("excitatory", None)
+
+        if excitatory > 1:
+            excitatory = 1
+        elif excitatory < 0:
+            excitatory = 0
+
+
+        self.a = 2**-6 * torch.ones(n)
+        self.b = 2**-2 * torch.ones(n)
+        self.c = -6.5 * torch.ones(n)
+
+        if excitatory == 1:
+            # self.r = torch.rand(n)
+            self.d = d_preset_ex * torch.ones(n)
+            self.S = 0.5 * torch.rand(n, n)
+            self.excitatory = torch.ones(n).byte()
+
+        elif excitatory == 0:
+            # self.r = torch.rand(n)
+            self.d = d_preset_in * torch.ones(n)
+            self.S = -torch.rand(n, n)
+            self.excitatory = torch.zeros(n).byte()
+
+        else:
+            self.excitatory = torch.zeros(n).byte()
+
+            ex = int(n * excitatory)
+            inh = n - ex
+
+            # init
+            self.d = torch.zeros(n)
+            self.S = torch.zeros(n, n)
+
+            # excitatory
+            self.d[:ex] = d_preset_ex * torch.ones(ex)
+            self.S[:, :ex] = 0.5 * torch.rand(n, ex)
+            self.excitatory[:ex] = 1
+
+            # inhibitory
+            self.d[ex:] = d_preset_in * torch.ones(inh)
+            self.S[:, ex:] = -torch.rand(n, inh)
+            self.excitatory[ex:] = 0
+
+        self.register_buffer("v", self.rest * torch.ones(n))  # Neuron voltages.
+        self.register_buffer("u", self.b * self.v)  # Neuron recovery.
+
+    def forward(self, x: torch.Tensor) -> None:
+        # language=rst
+        """
+        Runs a single simulation step.
+
+        :param x: Inputs to the layer.
+        """
+
+        # Voltage and recovery reset.
+        self.v = torch.where(self.s, self.c, self.v)
+        self.u = torch.where(self.s, self.u + self.d, self.u)
+
+        # Add inter-columnar input.
+        if self.s.any():
+            x += torch.cat(
+                [self.S[:, self.s[i]].sum(dim=1)[None] for i in range(self.s.shape[0])],
+                dim=0,
+            )
+
+        # Apply v and u updates.
+        self.v += self.dt * 0.5 * (2**-2 * self.v**2 + 2**2 * self.v + 14 - self.u + x)
+        self.v += self.dt * 0.5 * (2**-2 * self.v**2 + 2**2 * self.v + 14 - self.u + x)
+        self.u += self.dt * self.a * (self.b * self.v - self.u)
+
+        # Voltage clipping to lower bound.
+        if self.lbound is not None:
+            self.v.masked_fill_(self.v < self.lbound, self.lbound)
+
+        # Check for spiking neurons.
+        self.s = self.v >= self.thresh
+
+        super().forward(x)
+
+    def reset_state_variables(self) -> None:
+        # language=rst
+        """
+        Resets relevant state variables.
+        """
+        super().reset_state_variables()
+        self.v.fill_(self.rest)  # Neuron voltages.
+        self.u = self.b * self.v  # Neuron recovery.
+
+    def set_batch_size(self, batch_size) -> None:
+        # language=rst
+        """
+        Sets mini-batch size. Called when layer is added to a network.
+
+        :param batch_size: Mini-batch size.
+        """
+        super().set_batch_size(batch_size=batch_size)
+        self.v = self.rest * torch.ones(batch_size, *self.shape, device=self.v.device)
+        self.u = self.b * self.v
 class LIFNodes(Nodes):
     # language=rst
     """
@@ -1316,6 +1492,8 @@ class IzhikevichNodes(Nodes):
         self.u = self.b * self.v
 
 
+
+
 class CSRMNodes(Nodes):
     """
     A layer of Cumulative Spike Response Model (Gerstner and van Hemmen 1992, Gerstner et al. 1996) nodes.
@@ -1699,9 +1877,252 @@ class SRM0Nodes(Nodes):
         super().set_batch_size(batch_size=batch_size)
         self.v = self.rest * torch.ones(batch_size, *self.shape, device=self.v.device)
         self.refrac_count = torch.zeros_like(self.v, device=self.refrac_count.device)
-        
+"""
+Custom IzhikevichNodes với approximate multiplier từ evoapproxlib
+"""
 
-class IzhikevichHominNodes(Nodes):
+
+
+
+import torch
+import numpy as np
+from typing import Optional, Iterable, Union
+from bindsnet.network.nodes import Nodes
+
+# Import approximate multiplier
+try:
+    import pyximport
+    pyximport.install()
+    import mul12s_2PT
+    
+    def u2s(v):  # 24b unsigned to 24b signed
+        if v & 8388608:  # Bit 23 (MSB)
+            return v - 16777216  # 2^24
+        return v
+    
+    def approx_mul(a, b):
+        """
+        Approximate multiplication cho 2 số nguyên 12-bit signed
+        Input: a, b trong range [-2048, 2047]
+        Output: approximate result của a * b
+        """
+        # Clamp về range 12-bit signed
+        a = max(-2048, min(2047, int(a)))
+        b = max(-2048, min(2047, int(b)))
+        
+        # Sử dụng approximate multiplier
+        result = u2s(mul12s_2PT.mul(a, b))
+        return result
+    
+    APPROX_MUL_AVAILABLE = True
+except ImportError:
+    print("Warning: mul12s_2PT not available, using standard multiplication")
+    APPROX_MUL_AVAILABLE = False
+    
+    def approx_mul(a, b):
+        return int(a) * int(b)
+
+
+class IzhikevichNodesApprox(Nodes):
+    """
+    Izhikevich neurons với approximate multiplier.
+    Lưu ý: Approximate multiplier chỉ làm việc với số nguyên, nên chúng ta cần
+    scale các giá trị float về integer range trước khi nhân.
+    """
+
+    def __init__(
+        self,
+        n: Optional[int] = None,
+        shape: Optional[Iterable[int]] = None,
+        traces: bool = False,
+        traces_additive: bool = False,
+        tc_trace: Union[float, torch.Tensor] = 20.0,
+        trace_scale: Union[float, torch.Tensor] = 1.0,
+        sum_input: bool = False,
+        excitatory: float = 1,
+        thresh: Union[float, torch.Tensor] = 45.0,
+        rest: Union[float, torch.Tensor] = -65.0,
+        lbound: float = None,
+        scale_factor: int = 100,  # Scale factor để chuyển float -> int
+        **kwargs,
+    ) -> None:
+        """
+        Instantiates a layer of Izhikevich neurons với approximate multiplier.
+
+        :param scale_factor: Factor để scale float values về integer range cho approximate multiplier
+        """
+        super().__init__(
+            n=n,
+            shape=shape,
+            traces=traces,
+            traces_additive=traces_additive,
+            tc_trace=tc_trace,
+            trace_scale=trace_scale,
+            sum_input=sum_input,
+        )
+
+        self.register_buffer("rest", torch.tensor(rest))
+        self.register_buffer("thresh", torch.tensor(thresh))
+        self.lbound = lbound
+        self.scale_factor = scale_factor  # Để scale float -> int
+
+        self.register_buffer("r", None)
+        self.register_buffer("a", None)
+        self.register_buffer("b", None)
+        self.register_buffer("c", None)
+        self.register_buffer("d", None)
+        self.register_buffer("S", None)
+        self.register_buffer("excitatory", None)
+
+        if excitatory > 1:
+            excitatory = 1
+        elif excitatory < 0:
+            excitatory = 0
+
+        if excitatory == 1:
+            self.r = torch.rand(n)
+            self.a = 0.02 * torch.ones(n)
+            self.b = 0.2 * torch.ones(n)
+            self.c = -65.0 * torch.ones(n)
+            self.d = 8 * torch.ones(n)
+            self.S = 0.5 * torch.rand(n, n)
+            self.excitatory = torch.ones(n).byte()
+
+        elif excitatory == 0:
+            self.r = torch.rand(n)
+            self.a = 0.02 + 0.08 * self.r
+            self.b = 0.25 - 0.05 * self.r
+            self.c = -65.0 * torch.ones(n)
+            self.d = 2 * torch.ones(n)
+            self.S = -torch.rand(n, n)
+            self.excitatory = torch.zeros(n).byte()
+
+        else:
+            self.excitatory = torch.zeros(n).byte()
+
+            ex = int(n * excitatory)
+            inh = n - ex
+
+            # init
+            self.r = torch.zeros(n)
+            self.a = torch.zeros(n)
+            self.b = torch.zeros(n)
+            self.c = torch.zeros(n)
+            self.d = torch.zeros(n)
+            self.S = torch.zeros(n, n)
+
+            # excitatory
+            self.r[:ex] = torch.rand(ex)
+            self.a[:ex] = 0.02 * torch.ones(ex)
+            self.b[:ex] = 0.2 * torch.ones(ex)
+            self.c[:ex] = -65.0 + 15 * self.r[:ex] ** 2
+            self.d[:ex] = 8 - 6 * self.r[:ex] ** 2
+            self.S[:, :ex] = 0.5 * torch.rand(n, ex)
+            self.excitatory[:ex] = 1
+
+            # inhibitory
+            self.r[ex:] = torch.rand(inh)
+            self.a[ex:] = 0.02 + 0.08 * self.r[ex:]
+            self.b[ex:] = 0.25 - 0.05 * self.r[ex:]
+            self.c[ex:] = -65.0 * torch.ones(inh)
+            self.d[ex:] = 2 * torch.ones(inh)
+            self.S[:, ex:] = -torch.rand(n, inh)
+            self.excitatory[ex:] = 0
+
+        self.register_buffer("v", self.rest * torch.ones(n))
+        self.register_buffer("u", self.b * self.v)
+
+    def _approx_multiply_tensor(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        """
+        Approximate multiplication cho tensors.
+        Scale về integer, nhân approximate, scale lại về float.
+        """
+        if not APPROX_MUL_AVAILABLE:
+            return a * b
+        
+        # Scale về integer range (12-bit signed: -2048 to 2047)
+        a_int = (a * self.scale_factor).clamp(-2048, 2047).int()
+        b_int = (b * self.scale_factor).clamp(-2048, 2047).int()
+        
+        # Vectorized approximate multiplication
+        # Sử dụng list comprehension và stack để vectorize
+        flat_a = a_int.flatten().cpu().numpy()
+        flat_b = b_int.flatten().cpu().numpy()
+        
+        # Apply approximate multiplication element-wise
+        result_list = [approx_mul(int(flat_a[i]), int(flat_b[i])) 
+                       for i in range(len(flat_a))]
+        
+        result = torch.tensor(result_list, device=a.device, dtype=torch.float32)
+        result = result.reshape(a_int.shape)
+        
+        # Scale lại về float và chia cho scale_factor^2 (vì đã scale cả 2 số)
+        return result / (self.scale_factor ** 2)
+
+    def forward(self, x: torch.Tensor) -> None:
+        """
+        Runs a single simulation step với approximate multiplier.
+        """
+
+        # Voltage and recovery reset.
+        self.v = torch.where(self.s, self.c, self.v)
+        self.u = torch.where(self.s, self.u + self.d, self.u)
+
+        # Add inter-columnar input.
+        if self.s.any():
+            x += torch.cat(
+                [self.S[:, self.s[i]].sum(dim=1)[None] for i in range(self.s.shape[0])],
+                dim=0,
+            )
+
+        # Apply v and u updates với approximate multiplication
+        # Thay thế các phép nhân quan trọng bằng approximate multiplier
+        
+        # v^2 term với approximate multiplier
+        v_squared_approx = self._approx_multiply_tensor(self.v, self.v)
+        
+        # 0.04 * v^2
+        term1 = 0.04 * v_squared_approx  # Giữ phép nhân này vì là constant * tensor
+        
+        # 5 * v
+        term2 = 5 * self.v  # Giữ phép nhân này vì là constant * tensor
+        
+        # b * v (trong recovery update)
+        b_v_approx = self._approx_multiply_tensor(self.b, self.v)
+        
+        # Update v với approximate terms
+        self.v += self.dt * 0.5 * (term1 + term2 + 140 - self.u + x)
+        self.v += self.dt * 0.5 * (term1 + term2 + 140 - self.u + x)
+        
+        # Update u với approximate multiplication
+        self.u += self.dt * self.a * (b_v_approx - self.u)
+
+        # Voltage clipping to lower bound.
+        if self.lbound is not None:
+            self.v.masked_fill_(self.v < self.lbound, self.lbound)
+
+        # Check for spiking neurons.
+        self.s = self.v >= self.thresh
+
+        super().forward(x)
+
+    def reset_state_variables(self) -> None:
+        """
+        Resets relevant state variables.
+        """
+        super().reset_state_variables()
+        self.v.fill_(self.rest)
+        self.u = self.b * self.v
+
+    def set_batch_size(self, batch_size) -> None:
+        """
+        Sets mini-batch size. Called when layer is added to a network.
+        """
+        super().set_batch_size(batch_size=batch_size)
+        self.v = self.rest * torch.ones(batch_size, *self.shape, device=self.v.device)
+        self.u = self.b * self.v
+
+class IzhikevichRSNodes(Nodes):
     # language=rst
     """
     Layer of `Izhikevich neurons<https://www.izhikevich.org/publications/spikes.htm>`_.
@@ -1769,8 +2190,8 @@ class IzhikevichHominNodes(Nodes):
             self.r = torch.rand(n)
             self.a = 0.02 * torch.ones(n)
             self.b = 0.2 * torch.ones(n)
-            self.c = -65.0 + 15 * (self.r**2)
-            self.d = 8 - 6 * (self.r**2)
+            self.c = -65.0 * torch.ones(n)
+            self.d = 8 * torch.ones(n)
             self.S = 0.5 * torch.rand(n, n)
             self.excitatory = torch.ones(n).byte()
 
@@ -1871,3 +2292,6 @@ class IzhikevichHominNodes(Nodes):
         super().set_batch_size(batch_size=batch_size)
         self.v = self.rest * torch.ones(batch_size, *self.shape, device=self.v.device)
         self.u = self.b * self.v
+
+
+#toideptrai
