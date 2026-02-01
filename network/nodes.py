@@ -421,9 +421,9 @@ class IzhikevichHominNodes(Nodes):
     Layer of `Izhikevich neurons<https://www.izhikevich.org/publications/spikes.htm>`_.
     """
     TYPE_PRESETS = {
-        "RS":  {"d": 6},
-        "IB":  {"d": 4},
-        "CH":  {"d": 0.5},
+        "RS": {"d": 6},
+        "IB": {"d": 4},
+        "CH": {"d": 0.5},
         "LTS": {"d": 0.375},
     }
 
@@ -437,10 +437,10 @@ class IzhikevichHominNodes(Nodes):
         trace_scale: Union[float, torch.Tensor] = 1.0,
         sum_input: bool = False,
         excitatory: float = 1.0,
-        thresh: Union[float, torch.Tensor] = 4.5,   # scaled ~ 45mV
-        rest:   Union[float, torch.Tensor] = -6.5,  # scaled ~ -65mV
-        type_ex: str = "RS",   
-        type_in: str = "RS",                        
+        thresh: Union[float, torch.Tensor] = 4.5,  # scaled ~ 45mV
+        rest: Union[float, torch.Tensor] = -6.5,  # scaled ~ -65mV
+        type_ex: str = "RS",
+        type_in: str = "RS",
         lbound: float = None,
         **kwargs,
     ) -> None:
@@ -474,7 +474,7 @@ class IzhikevichHominNodes(Nodes):
         self.register_buffer("thresh", torch.tensor(thresh))  # Spike threshold voltage.
         self.lbound = lbound
 
-# --- Setup c and d ---
+        # --- Setup c and d ---
         tkey_ex = str(type_ex).upper()
         if tkey_ex not in self.TYPE_PRESETS:
             tkey_ex = "RS"
@@ -498,7 +498,6 @@ class IzhikevichHominNodes(Nodes):
             excitatory = 1
         elif excitatory < 0:
             excitatory = 0
-
 
         self.a = 2**-6 * torch.ones(n)
         self.b = 2**-2 * torch.ones(n)
@@ -591,6 +590,8 @@ class IzhikevichHominNodes(Nodes):
         super().set_batch_size(batch_size=batch_size)
         self.v = self.rest * torch.ones(batch_size, *self.shape, device=self.v.device)
         self.u = self.b * self.v
+
+
 class LIFNodes(Nodes):
     # language=rst
     """
@@ -1492,8 +1493,6 @@ class IzhikevichNodes(Nodes):
         self.u = self.b * self.v
 
 
-
-
 class CSRMNodes(Nodes):
     """
     A layer of Cumulative Spike Response Model (Gerstner and van Hemmen 1992, Gerstner et al. 1996) nodes.
@@ -1877,11 +1876,11 @@ class SRM0Nodes(Nodes):
         super().set_batch_size(batch_size=batch_size)
         self.v = self.rest * torch.ones(batch_size, *self.shape, device=self.v.device)
         self.refrac_count = torch.zeros_like(self.v, device=self.refrac_count.device)
+
+
 """
 Custom IzhikevichNodes với approximate multiplier từ evoapproxlib
 """
-
-
 
 
 import torch
@@ -1892,14 +1891,15 @@ from bindsnet.network.nodes import Nodes
 # Import approximate multiplier
 try:
     import pyximport
+
     pyximport.install()
     import mul12s_2PT
-    
+
     def u2s(v):  # 24b unsigned to 24b signed
         if v & 8388608:  # Bit 23 (MSB)
             return v - 16777216  # 2^24
         return v
-    
+
     def approx_mul(a, b):
         """
         Approximate multiplication cho 2 số nguyên 12-bit signed
@@ -1909,16 +1909,16 @@ try:
         # Clamp về range 12-bit signed
         a = max(-2048, min(2047, int(a)))
         b = max(-2048, min(2047, int(b)))
-        
+
         # Sử dụng approximate multiplier
         result = u2s(mul12s_2PT.mul(a, b))
         return result
-    
+
     APPROX_MUL_AVAILABLE = True
 except ImportError:
     print("Warning: mul12s_2PT not available, using standard multiplication")
     APPROX_MUL_AVAILABLE = False
-    
+
     def approx_mul(a, b):
         return int(a) * int(b)
 
@@ -2039,25 +2039,26 @@ class IzhikevichNodesApprox(Nodes):
         """
         if not APPROX_MUL_AVAILABLE:
             return a * b
-        
+
         # Scale về integer range (12-bit signed: -2048 to 2047)
         a_int = (a * self.scale_factor).clamp(-2048, 2047).int()
         b_int = (b * self.scale_factor).clamp(-2048, 2047).int()
-        
+
         # Vectorized approximate multiplication
         # Sử dụng list comprehension và stack để vectorize
         flat_a = a_int.flatten().cpu().numpy()
         flat_b = b_int.flatten().cpu().numpy()
-        
+
         # Apply approximate multiplication element-wise
-        result_list = [approx_mul(int(flat_a[i]), int(flat_b[i])) 
-                       for i in range(len(flat_a))]
-        
+        result_list = [
+            approx_mul(int(flat_a[i]), int(flat_b[i])) for i in range(len(flat_a))
+        ]
+
         result = torch.tensor(result_list, device=a.device, dtype=torch.float32)
         result = result.reshape(a_int.shape)
-        
+
         # Scale lại về float và chia cho scale_factor^2 (vì đã scale cả 2 số)
-        return result / (self.scale_factor ** 2)
+        return result / (self.scale_factor**2)
 
     def forward(self, x: torch.Tensor) -> None:
         """
@@ -2077,23 +2078,23 @@ class IzhikevichNodesApprox(Nodes):
 
         # Apply v and u updates với approximate multiplication
         # Thay thế các phép nhân quan trọng bằng approximate multiplier
-        
+
         # v^2 term với approximate multiplier
         v_squared_approx = self._approx_multiply_tensor(self.v, self.v)
-        
+
         # 0.04 * v^2
         term1 = 0.04 * v_squared_approx  # Giữ phép nhân này vì là constant * tensor
-        
+
         # 5 * v
         term2 = 5 * self.v  # Giữ phép nhân này vì là constant * tensor
-        
+
         # b * v (trong recovery update)
         b_v_approx = self._approx_multiply_tensor(self.b, self.v)
-        
+
         # Update v với approximate terms
         self.v += self.dt * 0.5 * (term1 + term2 + 140 - self.u + x)
         self.v += self.dt * 0.5 * (term1 + term2 + 140 - self.u + x)
-        
+
         # Update u với approximate multiplication
         self.u += self.dt * self.a * (b_v_approx - self.u)
 
@@ -2121,6 +2122,7 @@ class IzhikevichNodesApprox(Nodes):
         super().set_batch_size(batch_size=batch_size)
         self.v = self.rest * torch.ones(batch_size, *self.shape, device=self.v.device)
         self.u = self.b * self.v
+
 
 class IzhikevichRSNodes(Nodes):
     # language=rst
@@ -2294,4 +2296,4 @@ class IzhikevichRSNodes(Nodes):
         self.u = self.b * self.v
 
 
-#toideptraivlcsadsađâ
+# toideptraivlcsadsađâ

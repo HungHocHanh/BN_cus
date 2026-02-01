@@ -59,6 +59,7 @@ environment_pipeline = EnvironmentPipeline(
     render_interval=None,
 )
 
+
 # ----------------- CHECKPOINT -----------------
 def save_checkpoint(network, episode, path=CHECKPOINT_PATH):
     state = {
