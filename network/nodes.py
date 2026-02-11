@@ -1389,8 +1389,8 @@ class IzhikevichNodes(Nodes):
             self.r = torch.rand(n)
             self.a = 0.02 * torch.ones(n)
             self.b = 0.2 * torch.ones(n)
-            self.c = -65.0 + 15 * (self.r**2)
-            self.d = 8 - 6 * (self.r**2)
+            self.c = -65.0 * torch.ones(n)
+            self.d = 8 * torch.ones(n)
             self.S = 0.5 * torch.rand(n, n)
             self.excitatory = torch.ones(n).byte()
 
