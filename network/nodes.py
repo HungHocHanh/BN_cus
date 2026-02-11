@@ -2294,6 +2294,183 @@ class IzhikevichRSNodes(Nodes):
         super().set_batch_size(batch_size=batch_size)
         self.v = self.rest * torch.ones(batch_size, *self.shape, device=self.v.device)
         self.u = self.b * self.v
+class IzhikevichHominNodesFixed(Nodes):
+    """
+    Layer of Izhikevich neurons implemented using pure Fixed-Point Arithmetic (Q1.6.9).
+    This mimics hardware behavior (FPGA/ASIC) directly in Python.
+    """
+    
+    # Cấu hình Fixed-Point Q1.6.9
+    FRAC_BITS = 9
+    SCALE = 1 << FRAC_BITS  # 512
 
+    # Các hằng số phần cứng (HOMIN)
+    # 14.0 * 512 = 7168
+    CONST_14_FIXED = 14 * SCALE 
+    
+    TYPE_PRESETS = {
+        "RS": {"d": 6},
+        "IB": {"d": 4},
+        "CH": {"d": 0.5},
+        "LTS": {"d": 0.375},
+    }
+
+    def __init__(
+        self,
+        n: Optional[int] = None,
+        shape: Optional[Iterable[int]] = None,
+        traces: bool = False,
+        traces_additive: bool = False,
+        tc_trace: Union[float, torch.Tensor] = 20.0,
+        trace_scale: Union[float, torch.Tensor] = 1.0,
+        sum_input: bool = False,
+        excitatory: float = 1.0,
+        thresh: float = 30.0,   # Ngưỡng chuẩn HOMIN là 30 (User có thể để 4.5 nếu muốn)
+        rest: float = -65.0,    # Reset chuẩn HOMIN là -65 (User có thể để -6.5 nếu muốn)
+        type_ex: str = "RS",
+        type_in: str = "RS",
+        lbound: float = None,
+        **kwargs,
+    ) -> None:
+        
+        super().__init__(
+            n=n,
+            shape=shape,
+            traces=traces,
+            traces_additive=traces_additive,
+            tc_trace=tc_trace,
+            trace_scale=trace_scale,
+            sum_input=sum_input,
+        )
+
+        # --- 1. Chuyển đổi tham số sang Fixed-Point (Integer) ---
+        # thresh_fixed = thresh * 512
+        self.register_buffer("thresh", torch.tensor(int(thresh * self.SCALE), dtype=torch.int32))
+        self.register_buffer("rest", torch.tensor(int(rest * self.SCALE), dtype=torch.int32))
+        
+        if lbound is not None:
+            self.lbound = int(lbound * self.SCALE)
+        else:
+            self.lbound = None
+
+        # --- 2. Xử lý Presets (d) ---
+        tkey_ex = type_ex.upper() if type_ex.upper() in self.TYPE_PRESETS else "RS"
+        tkey_in = type_in.upper() if type_in.upper() in self.TYPE_PRESETS else "RS"
+
+        d_val_ex = self.TYPE_PRESETS[tkey_ex]["d"]
+        d_val_in = self.TYPE_PRESETS[tkey_in]["d"]
+
+        # --- 3. Khởi tạo Trọng số S và tham số d (Dạng Integer) ---
+        self.register_buffer("d", torch.zeros(n, dtype=torch.int32))
+        self.register_buffer("S", torch.zeros((n, n), dtype=torch.int32))
+        self.register_buffer("excitatory", torch.zeros(n, dtype=torch.uint8)) # Byte tensor
+
+        if excitatory > 1: excitatory = 1
+        elif excitatory < 0: excitatory = 0
+
+        # Xác định số lượng nơ-ron hưng phấn/ức chế
+        ex = int(n * excitatory)
+        inh = n - ex
+
+        # Thiết lập d và S (đã scale)
+        # Excitatory part
+        if ex > 0:
+            self.d[:ex] = int(d_val_ex * self.SCALE)
+            self.excitatory[:ex] = 1
+            # Trọng số ngẫu nhiên từ 0 đến 0.5 -> Scale thành 0 đến 256
+            self.S[:, :ex] = (0.5 * torch.rand(n, ex) * self.SCALE).int()
+
+        # Inhibitory part
+        if inh > 0:
+            self.d[ex:] = int(d_val_in * self.SCALE)
+            self.excitatory[ex:] = 0
+            # Trọng số âm -> Scale thành số âm
+            self.S[:, ex:] = (-1.0 * torch.rand(n, inh) * self.SCALE).int()
+
+        # --- 4. Khởi tạo biến trạng thái (Integer) ---
+        # v bắt đầu tại rest
+        self.register_buffer("v", self.rest * torch.ones(n, dtype=torch.int32))
+        # u = b * v = 0.25 * v -> v >> 2
+        self.register_buffer("u", self.v >> 2) 
+
+    def forward(self, x: torch.Tensor) -> None:
+        """
+        Runs a single simulation step using BITWISE OPERATIONS.
+        :param x: Input current. Must be integer (scaled by 512) or will be cast.
+        """
+        # Đảm bảo input x là số nguyên (int32)
+        if x.dtype != torch.int32 and x.dtype != torch.long:
+            x = (x * self.SCALE).int()
+        
+        # 1. Logic Reset (So sánh với threshold từ bước trước)
+        # Nếu spike: v = c (rest), u = u + d
+        self.v = torch.where(self.s, self.rest, self.v)
+        self.u = torch.where(self.s, self.u + self.d, self.u)
+
+        # 2. Xử lý Synaptic Input (Cộng trọng số S)
+        # Nếu có spike từ các nơ-ron khác, cộng trọng số S vào input x
+        if self.s.any():
+            # Lấy các cột trọng số tương ứng với nơ-ron phát xung và cộng dồn
+            # S đã là int, x là int -> Phép cộng integer
+            x += torch.cat(
+                [self.S[:, self.s[i]].sum(dim=1)[None] for i in range(self.s.shape[0])],
+                dim=0,
+            )
+
+        # 3. Tính toán Dynamics v (HOMIN Equation 7)
+        # Công thức: v_next = v + ( (v^2/4) + 5v + 140 - u + I ) * dt
+        
+        # A. Thành phần bậc 2: 0.25 * v^2
+        # v (Q9) * v (Q9) = v^2 (Q18)
+        # Cần đưa về Q9 (>>9) và nhân 0.25 (>>2) => Tổng dịch phải 11
+        # Sử dụng .long() để tránh tràn số khi bình phương
+        v_sq = (self.v.long() * self.v.long()) >> 11  
+        
+        # B. Thành phần tuyến tính: 5v = 4v + v
+        v_linear = (self.v << 2) + self.v
+        
+        # C. Tổng hợp (dùng long để cộng trừ an toàn)
+        # 14 ở đây là self.CONST_14_FIXED (đã scale)
+        term_sum = v_sq + v_linear + self.CONST_14_FIXED - self.u + x
+        
+        # D. Nhân bước thời gian dt = 1/32 (>>> 5)
+        # Kết quả trả về int32
+        delta_v = (term_sum >> 5).int()
+        
+        # Cập nhật v
+        self.v += delta_v
+
+        # 4. Tính toán Dynamics u
+        # Công thức: u_next = u + (0.25v - u) * a
+        # a * dt tương đương phép dịch >>> 11
+        # 0.25v tương đương v >>> 2
+        u_diff = (self.v >> 2) - self.u
+        delta_u = u_diff >> 11 # Dịch 11 bit (dt + a)
+        
+        self.u += delta_u
+
+        # 5. Voltage Clipping (Giới hạn dưới)
+        if self.lbound is not None:
+            self.v.masked_fill_(self.v < self.lbound, self.lbound)
+
+        # 6. Kiểm tra phát xung (Comparator)
+        self.s = self.v >= self.thresh
+
+        # BindsNet hook (ghi lại spike trace nếu cần)
+        super().forward(x)
+
+    def reset_state_variables(self) -> None:
+        """
+        Resets state variables to initial values (Integer).
+        """
+        super().reset_state_variables()
+        self.v.fill_(self.rest)
+        self.u = self.v >> 2 # u = 0.25 * v
+
+    def set_batch_size(self, batch_size) -> None:
+        super().set_batch_size(batch_size=batch_size)
+        # Khởi tạo lại với đúng kích thước batch
+        self.v = self.rest * torch.ones(batch_size, *self.shape, device=self.v.device, dtype=torch.int32)
+        self.u = self.v >> 2
 
 # toideptraivlcsadsađâ
