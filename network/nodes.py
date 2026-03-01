@@ -2124,176 +2124,6 @@ class IzhikevichNodesApprox(Nodes):
         self.u = self.b * self.v
 
 
-class IzhikevichRSNodes(Nodes):
-    # language=rst
-    """
-    Layer of `Izhikevich neurons<https://www.izhikevich.org/publications/spikes.htm>`_.
-    """
-
-    def __init__(
-        self,
-        n: Optional[int] = None,
-        shape: Optional[Iterable[int]] = None,
-        traces: bool = False,
-        traces_additive: bool = False,
-        tc_trace: Union[float, torch.Tensor] = 20.0,
-        trace_scale: Union[float, torch.Tensor] = 1.0,
-        sum_input: bool = False,
-        excitatory: float = 1,
-        thresh: Union[float, torch.Tensor] = 45.0,
-        rest: Union[float, torch.Tensor] = -65.0,
-        lbound: float = None,
-        **kwargs,
-    ) -> None:
-        # language=rst
-        """
-        Instantiates a layer of Izhikevich neurons.
-
-        :param n: The number of neurons in the layer.
-        :param shape: The dimensionality of the layer.
-        :param traces: Whether to record spike traces.
-        :param traces_additive: Whether to record spike traces additively.
-        :param tc_trace: Time constant of spike trace decay.
-        :param trace_scale: Scaling factor for spike trace.
-        :param sum_input: Whether to sum all inputs.
-        :param excitatory: Percent of excitatory (vs. inhibitory) neurons in the layer; in range ``[0, 1]``.
-        :param thresh: Spike threshold voltage.
-        :param rest: Resting membrane voltage.
-        :param lbound: Lower bound of the voltage.
-        """
-        super().__init__(
-            n=n,
-            shape=shape,
-            traces=traces,
-            traces_additive=traces_additive,
-            tc_trace=tc_trace,
-            trace_scale=trace_scale,
-            sum_input=sum_input,
-        )
-
-        self.register_buffer("rest", torch.tensor(rest))  # Rest voltage.
-        self.register_buffer("thresh", torch.tensor(thresh))  # Spike threshold voltage.
-        self.lbound = lbound
-
-        self.register_buffer("r", None)
-        self.register_buffer("a", None)
-        self.register_buffer("b", None)
-        self.register_buffer("c", None)
-        self.register_buffer("d", None)
-        self.register_buffer("S", None)
-        self.register_buffer("excitatory", None)
-
-        if excitatory > 1:
-            excitatory = 1
-        elif excitatory < 0:
-            excitatory = 0
-
-        if excitatory == 1:
-            self.r = torch.rand(n)
-            self.a = 0.02 * torch.ones(n)
-            self.b = 0.2 * torch.ones(n)
-            self.c = -65.0 * torch.ones(n)
-            self.d = 8 * torch.ones(n)
-            self.S = 0.5 * torch.rand(n, n)
-            self.excitatory = torch.ones(n).byte()
-
-        elif excitatory == 0:
-            self.r = torch.rand(n)
-            self.a = 0.02 + 0.08 * self.r
-            self.b = 0.25 - 0.05 * self.r
-            self.c = -65.0 * torch.ones(n)
-            self.d = 2 * torch.ones(n)
-            self.S = -torch.rand(n, n)
-
-            self.excitatory = torch.zeros(n).byte()
-
-        else:
-            self.excitatory = torch.zeros(n).byte()
-
-            ex = int(n * excitatory)
-            inh = n - ex
-
-            # init
-            self.r = torch.zeros(n)
-            self.a = torch.zeros(n)
-            self.b = torch.zeros(n)
-            self.c = torch.zeros(n)
-            self.d = torch.zeros(n)
-            self.S = torch.zeros(n, n)
-
-            # excitatory
-            self.r[:ex] = torch.rand(ex)
-            self.a[:ex] = 0.02 * torch.ones(ex)
-            self.b[:ex] = 0.2 * torch.ones(ex)
-            self.c[:ex] = -65.0 + 15 * self.r[:ex] ** 2
-            self.d[:ex] = 8 - 6 * self.r[:ex] ** 2
-            self.S[:, :ex] = 0.5 * torch.rand(n, ex)
-            self.excitatory[:ex] = 1
-
-            # inhibitory
-            self.r[ex:] = torch.rand(inh)
-            self.a[ex:] = 0.02 + 0.08 * self.r[ex:]
-            self.b[ex:] = 0.25 - 0.05 * self.r[ex:]
-            self.c[ex:] = -65.0 * torch.ones(inh)
-            self.d[ex:] = 2 * torch.ones(inh)
-            self.S[:, ex:] = -torch.rand(n, inh)
-            self.excitatory[ex:] = 0
-
-        self.register_buffer("v", self.rest * torch.ones(n))  # Neuron voltages.
-        self.register_buffer("u", self.b * self.v)  # Neuron recovery.
-
-    def forward(self, x: torch.Tensor) -> None:
-        # language=rst
-        """
-        Runs a single simulation step.
-
-        :param x: Inputs to the layer.
-        """
-
-        # Voltage and recovery reset.
-        self.v = torch.where(self.s, self.c, self.v)
-        self.u = torch.where(self.s, self.u + self.d, self.u)
-
-        # Add inter-columnar input.
-        if self.s.any():
-            x += torch.cat(
-                [self.S[:, self.s[i]].sum(dim=1)[None] for i in range(self.s.shape[0])],
-                dim=0,
-            )
-
-        # Apply v and u updates.
-        self.v += self.dt * 0.5 * (0.04 * self.v**2 + 5 * self.v + 140 - self.u + x)
-        self.v += self.dt * 0.5 * (0.04 * self.v**2 + 5 * self.v + 140 - self.u + x)
-        self.u += self.dt * self.a * (self.b * self.v - self.u)
-
-        # Voltage clipping to lower bound.
-        if self.lbound is not None:
-            self.v.masked_fill_(self.v < self.lbound, self.lbound)
-
-        # Check for spiking neurons.
-        self.s = self.v >= self.thresh
-
-        super().forward(x)
-
-    def reset_state_variables(self) -> None:
-        # language=rst
-        """
-        Resets relevant state variables.
-        """
-        super().reset_state_variables()
-        self.v.fill_(self.rest)  # Neuron voltages.
-        self.u = self.b * self.v  # Neuron recovery.
-
-    def set_batch_size(self, batch_size) -> None:
-        # language=rst
-        """
-        Sets mini-batch size. Called when layer is added to a network.
-
-        :param batch_size: Mini-batch size.
-        """
-        super().set_batch_size(batch_size=batch_size)
-        self.v = self.rest * torch.ones(batch_size, *self.shape, device=self.v.device)
-        self.u = self.b * self.v
 class IzhikevichHominNodesFixed(Nodes):
     """
     Layer of Izhikevich neurons implemented using pure Fixed-Point Arithmetic (Q1.6.9).
@@ -2472,5 +2302,643 @@ class IzhikevichHominNodesFixed(Nodes):
         # Khởi tạo lại với đúng kích thước batch
         self.v = self.rest * torch.ones(batch_size, *self.shape, device=self.v.device, dtype=torch.int32)
         self.u = self.v >> 2
+
+
+
+# class IzhikevichRSNodesFixed(Nodes):
+#     """
+#     Phiên bản Fixed Point của Izhikevich RS Nodes sử dụng PyTorch.
+#     """
+
+#     def __init__(
+#         self,
+#         n: Optional[int] = None,
+#         shape: Optional[Iterable[int]] = None,
+#         traces: bool = False,
+#         traces_additive: bool = False,
+#         tc_trace: Union[float, torch.Tensor] = 20.0,
+#         trace_scale: Union[float, torch.Tensor] = 1.0,
+#         sum_input: bool = False,
+#         excitatory: float = 1,
+#         thresh: Union[float, torch.Tensor] = 30.0, # Thường là 30mV
+#         rest: Union[float, torch.Tensor] = -65.0,
+#         lbound: float = None,
+#         fractional_bits: int = 16, # Số bit cho phần thập phân
+#         **kwargs,
+#     ) -> None:
+#         super().__init__(
+#             n=n,
+#             shape=shape,
+#             traces=traces,
+#             traces_additive=traces_additive,
+#             tc_trace=tc_trace,
+#             trace_scale=trace_scale,
+#             sum_input=sum_input,
+#         )
+
+#         self.f_bits = fractional_bits
+#         self.scale = 1 << self.f_bits
+
+#         # Chuyển đổi các ngưỡng và hằng số sang Fixed Point
+#         self.register_buffer("rest", self._to_fixed(torch.tensor(rest)))
+#         self.register_buffer("thresh", self._to_fixed(torch.tensor(thresh)))
+        
+#         # Các hằng số trong phương trình Izhikevich
+#         self.register_buffer("c004", self._to_fixed(torch.tensor(0.04)))
+#         self.register_buffer("c5", self._to_fixed(torch.tensor(5.0)))
+#         self.register_buffer("c140", self._to_fixed(torch.tensor(140.0)))
+
+#         # Khởi tạo tham số a, b, c, d
+#         self._init_parameters(n, excitatory)
+        
+#         # Khởi tạo trạng thái v, u ở dạng Fixed Point
+#         self.register_buffer("v", self.rest.clone().repeat(n))
+#         self.register_buffer("u", self._mul_fixed(self.b, self.v))
+
+#     def _to_fixed(self, x):
+#         return (x * self.scale).round()
+
+#     def _from_fixed(self, x):
+#         return x.float() / self.scale
+
+#     def _mul_fixed(self, x, y):
+#         # (x * y) / scale để giữ nguyên vị trí dấu phẩy tĩnh
+#         return (x * y) >> self.f_bits
+
+#     def _init_parameters(self, n, excitatory):
+#         # Logic khởi tạo tham số a, b, c, d tương tự bản gốc nhưng chuyển sang Fixed Point
+#         r = torch.rand(n)
+#         a_f = torch.zeros(n)
+#         b_f = torch.zeros(n)
+#         c_f = torch.zeros(n)
+#         d_f = torch.zeros(n)
+
+#         ex = int(n * excitatory)
+#         # Excitatory
+#         a_f[:ex] = 0.02
+#         b_f[:ex] = 0.2
+#         c_f[:ex] = -65.0 + 15 * (r[:ex] ** 2)
+#         d_f[:ex] = 8 - 6 * (r[:ex] ** 2)
+        
+#         # Inhibitory
+#         if ex < n:
+#             a_f[ex:] = 0.02 + 0.08 * r[ex:]
+#             b_f[ex:] = 0.25 - 0.05 * r[ex:]
+#             c_f[ex:] = -65.0
+#             d_f[ex:] = 2.0
+
+#         self.register_buffer("a", self._to_fixed(a_f))
+#         self.register_buffer("b", self._to_fixed(b_f))
+#         self.register_buffer("c", self._to_fixed(c_f))
+#         self.register_buffer("d", self._to_fixed(d_f))
+
+#     def forward(self, x: torch.Tensor) -> None:
+#         # 1. Chuyển đổi đầu vào x sang Fixed Point
+#         x_fixed = self._to_fixed(x)
+#         dt_fixed = self._to_fixed(torch.tensor(self.dt))
+
+#         # 2. Reset điện áp và biến hồi phục nếu có Spike
+#         # self.s là tensor boolean đánh dấu các neuron đã spike ở bước trước
+#         self.v = torch.where(self.s, self.c, self.v)
+#         self.u = torch.where(self.s, self.u + self.d, self.u)
+
+#         # 3. Cập nhật phương trình v (Thực hiện 2 bước 0.5*dt để ổn định như bản gốc)
+#         # dv = 0.04*v^2 + 5*v + 140 - u + I
+#         for _ in range(2):
+#             v_sq = self._mul_fixed(self.v, self.v)
+#             term1 = self._mul_fixed(self.c004, v_sq)
+#             term2 = self._mul_fixed(self.c5, self.v)
+            
+#             dv = term1 + term2 + self.c140 - self.u + x_fixed
+            
+#             # self.v += 0.5 * dv * dt
+#             # Vì ta chạy 2 lần nên mỗi lần là 0.5 * dt
+#             step_v = self._mul_fixed(dv, dt_fixed >> 1) 
+#             self.v += step_v
+
+#         # 4. Cập nhật phương trình u
+#         # du = a * (b * v - u)
+#         b_v = self._mul_fixed(self.b, self.v)
+#         du = self._mul_fixed(self.a, b_v - self.u)
+#         self.u += self._mul_fixed(du, dt_fixed)
+
+#         # 5. Kiểm tra Spike
+#         self.s = self.v >= self.thresh
+
+#         # Gọi super forward để cập nhật traces nếu cần
+#         super(Nodes, self).forward(x)
+
+#     def reset_state_variables(self) -> None:
+#         super().reset_state_variables()
+#         self.v.fill_(self.rest)
+#         self.u = self._mul_fixed(self.b, self.v)
+
+class IzhikevichRSNodes(Nodes):
+    # language=rst
+    """
+    Layer of `Izhikevich neurons<https://www.izhikevich.org/publications/spikes.htm>`_.
+    """
+
+    def __init__(
+        self,
+        n: Optional[int] = None,
+        shape: Optional[Iterable[int]] = None,
+        traces: bool = False,
+        traces_additive: bool = False,
+        tc_trace: Union[float, torch.Tensor] = 20.0,
+        trace_scale: Union[float, torch.Tensor] = 1.0,
+        sum_input: bool = False,
+        excitatory: float = 1,
+        thresh: Union[float, torch.Tensor] = 45.0,
+        rest: Union[float, torch.Tensor] = -65.0,
+        lbound: float = None,
+        **kwargs,
+    ) -> None:
+        # language=rst
+        """
+        Instantiates a layer of Izhikevich neurons.
+
+        :param n: The number of neurons in the layer.
+        :param shape: The dimensionality of the layer.
+        :param traces: Whether to record spike traces.
+        :param traces_additive: Whether to record spike traces additively.
+        :param tc_trace: Time constant of spike trace decay.
+        :param trace_scale: Scaling factor for spike trace.
+        :param sum_input: Whether to sum all inputs.
+        :param excitatory: Percent of excitatory (vs. inhibitory) neurons in the layer; in range ``[0, 1]``.
+        :param thresh: Spike threshold voltage.
+        :param rest: Resting membrane voltage.
+        :param lbound: Lower bound of the voltage.
+        """
+        super().__init__(
+            n=n,
+            shape=shape,
+            traces=traces,
+            traces_additive=traces_additive,
+            tc_trace=tc_trace,
+            trace_scale=trace_scale,
+            sum_input=sum_input,
+        )
+
+        self.register_buffer("rest", torch.tensor(rest))  # Rest voltage.
+        self.register_buffer("thresh", torch.tensor(thresh))  # Spike threshold voltage.
+        self.lbound = lbound
+
+        self.register_buffer("r", None)
+        self.register_buffer("a", None)
+        self.register_buffer("b", None)
+        self.register_buffer("c", None)
+        self.register_buffer("d", None)
+        self.register_buffer("S", None)
+        self.register_buffer("excitatory", None)
+
+        if excitatory > 1:
+            excitatory = 1
+        elif excitatory < 0:
+            excitatory = 0
+
+        if excitatory == 1:
+            self.r = torch.rand(n)
+            self.a = 0.02 * torch.ones(n)
+            self.b = 0.2 * torch.ones(n)
+            self.c = -65.0 * torch.ones(n)
+            self.d = 8 * torch.ones(n)
+            self.S = 0.5 * torch.rand(n, n)
+            self.excitatory = torch.ones(n).byte()
+
+        elif excitatory == 0:
+            self.r = torch.rand(n)
+            self.a = 0.02 * torch.ones(n)
+            self.b = 0.2 * torch.ones(n)
+            self.c = -65.0 * torch.ones(n)
+            self.d = 8 * torch.ones(n)
+            self.S = -torch.rand(n, n)
+
+            self.excitatory = torch.zeros(n).byte()
+
+        else:
+            self.excitatory = torch.zeros(n).byte()
+
+            ex = int(n * excitatory)
+            inh = n - ex
+
+            # init
+            self.r = torch.zeros(n)
+            self.a = torch.zeros(n)
+            self.b = torch.zeros(n)
+            self.c = torch.zeros(n)
+            self.d = torch.zeros(n)
+            self.S = torch.zeros(n, n)
+
+            # excitatory
+            self.r[:ex] = torch.rand(ex)
+            self.a[:ex] = 0.02 * torch.ones(ex)
+            self.b[:ex] = 0.2 * torch.ones(ex)
+            self.c[:ex] = -65.0 * torch.ones(ex)
+            self.d[:ex] = 8 * torch.ones(ex)
+            self.S[:, :ex] = 0.5 * torch.rand(n, ex)
+            self.excitatory[:ex] = 1
+
+            # inhibitory
+            self.r[ex:] = torch.rand(inh)
+            self.a[ex:] = 0.02 * torch.ones(inh)
+            self.b[ex:] = 0.2 * torch.ones(inh)
+            self.c[ex:] = -65.0 * torch.ones(inh)
+            self.d[ex:] = 8 * torch.ones(inh)
+            self.S[:, ex:] = -torch.rand(n, inh)
+            self.excitatory[ex:] = 0
+
+        self.register_buffer("v", self.rest * torch.ones(n))  # Neuron voltages.
+        self.register_buffer("u", self.b * self.v)  # Neuron recovery.
+
+    def forward(self, x: torch.Tensor) -> None:
+        # language=rst
+        """
+        Runs a single simulation step.
+
+        :param x: Inputs to the layer.
+        """
+
+        # Voltage and recovery reset.
+        self.v = torch.where(self.s, self.c, self.v)
+        self.u = torch.where(self.s, self.u + self.d, self.u)
+
+        # Add inter-columnar input.
+        if self.s.any():
+            x += torch.cat(
+                [self.S[:, self.s[i]].sum(dim=1)[None] for i in range(self.s.shape[0])],
+                dim=0,
+            )
+
+        # Apply v and u updates.
+        self.v += self.dt * 0.5 * (0.04 * self.v**2 + 5 * self.v + 140 - self.u + x)
+        self.v += self.dt * 0.5 * (0.04 * self.v**2 + 5 * self.v + 140 - self.u + x)
+        self.u += self.dt * self.a * (self.b * self.v - self.u)
+
+        # Voltage clipping to lower bound.
+        if self.lbound is not None:
+            self.v.masked_fill_(self.v < self.lbound, self.lbound)
+
+        # Check for spiking neurons.
+        self.s = self.v >= self.thresh
+
+        super().forward(x)
+
+    def reset_state_variables(self) -> None:
+        # language=rst
+        """
+        Resets relevant state variables.
+        """
+        super().reset_state_variables()
+        self.v.fill_(self.rest)  # Neuron voltages.
+        self.u = self.b * self.v  # Neuron recovery.
+
+    def set_batch_size(self, batch_size) -> None:
+        # language=rst
+        """
+        Sets mini-batch size. Called when layer is added to a network.
+
+        :param batch_size: Mini-batch size.
+        """
+        super().set_batch_size(batch_size=batch_size)
+        self.v = self.rest * torch.ones(batch_size, *self.shape, device=self.v.device)
+        self.u = self.b * self.v
+
+class IzhikevichRSFixedNodes(Nodes):
+    # language=rst
+    """
+    Layer of `Izhikevich neurons<https://www.izhikevich.org/publications/spikes.htm>`_.
+    """
+
+    def __init__(
+        self,
+        n: Optional[int] = None,
+        shape: Optional[Iterable[int]] = None,
+        traces: bool = False,
+        traces_additive: bool = False,
+        tc_trace: Union[float, torch.Tensor] = 20.0,
+        trace_scale: Union[float, torch.Tensor] = 1.0,
+        sum_input: bool = False,
+        excitatory: float = 1,
+        thresh: Union[float, torch.Tensor] = 45.0,
+        rest: Union[float, torch.Tensor] = -65.0,
+        lbound: float = None,
+        fractional_bits: int = 16,
+        **kwargs,
+    ) -> None:
+        super().__init__(
+            n=n,
+            shape=shape,
+            traces=traces,
+            traces_additive=traces_additive,
+            tc_trace=tc_trace,
+            trace_scale=trace_scale,
+            sum_input=sum_input,
+        )
+        self.f_bits = fractional_bits
+        self.scale = 1 << self.f_bits
+
+
+        dt_value = self.dt if self.dt is not None else 1.0
+        self.register_buffer("dt_fixed", torch.tensor(dt_value * self.scale).round().long())
+
+        self.register_buffer("rest", torch.tensor(rest * self.scale).round().long())
+        self.register_buffer("thresh", torch.tensor(thresh * self.scale).round().long())
+        
+        if lbound is not None: 
+            self.lbound = (lbound * self.scale).round().long()
+        else:
+            self.lbound = None
+        
+        self.register_buffer("r", None)
+        self.register_buffer("a", None)
+        self.register_buffer("b", None)
+        self.register_buffer("c", None)
+        self.register_buffer("d", None)
+        self.register_buffer("S", None)
+        self.register_buffer("excitatory", None)
+
+        if excitatory > 1:
+            excitatory = 1
+        elif excitatory < 0:
+            excitatory = 0
+
+        if excitatory == 1:
+            self.r = torch.rand(n)
+            self.a = (0.02 * torch.ones(n) * self.scale).round().long()
+            self.b = (0.2 * torch.ones(n) * self.scale).round().long()
+            self.c = (-65.0 * torch.ones(n) * self.scale).round().long()
+            self.d = (8 * torch.ones(n) * self.scale).round().long()
+            self.S = 0.5 * torch.rand(n, n)
+            self.excitatory = torch.ones(n).byte()
+
+        elif excitatory == 0:
+            self.r = torch.rand(n)
+            self.a = (0.02 * torch.ones(n) * self.scale).round().long()
+            self.b = (0.2 * torch.ones(n) * self.scale).round().long()
+            self.c = (-65.0 * torch.ones(n) * self.scale).round().long()
+            self.d = (8 * torch.ones(n) * self.scale).long()
+            self.S = -torch.rand(n, n)
+            self.excitatory = torch.zeros(n).byte()
+
+        else:
+            self.excitatory = torch.zeros(n).byte()
+            ex = int(n * excitatory)
+            inh = n - ex
+
+            self.r = torch.zeros(n)
+            self.a = torch.zeros(n).long()
+            self.b = torch.zeros(n).long()
+            self.c = torch.zeros(n).long()
+            self.d = torch.zeros(n).long()
+            self.S = torch.zeros(n, n)
+
+            self.r[:ex] = torch.rand(ex)
+            self.a[:ex] = (0.02 * torch.ones(ex) * self.scale).round().long()
+            self.b[:ex] = (0.2 * torch.ones(ex) * self.scale).round().long()
+            self.c[:ex] = (-65.0 * torch.ones(ex) * self.scale).round().long()
+            self.d[:ex] = (8 * torch.ones(ex) * self.scale).round().long()
+            self.S[:, :ex] = 0.5 * torch.rand(n, ex)
+            self.excitatory[:ex] = 1
+
+            self.r[ex:] = torch.rand(inh)
+            self.a[ex:] = (0.02 * torch.ones(inh) * self.scale).round().long()
+            self.b[ex:] = (0.2 * torch.ones(inh) * self.scale).round().long()
+            self.c[ex:] = (-65.0 * torch.ones(inh) * self.scale).round().long()
+            self.d[ex:] = (8 * torch.ones(inh) * self.scale).round().long()
+            self.S[:, ex:] = -torch.rand(n, inh)
+            self.excitatory[ex:] = 0
+
+        self.register_buffer("v", (self.rest * torch.ones(n)).long())
+        self.register_buffer("u", self.mul_fixed(self.b, self.v))
+
+        self.register_buffer("c004", torch.tensor(0.04 * self.scale).round().long())
+        self.register_buffer("c5", torch.tensor(5.0 * self.scale).round().long())
+        self.register_buffer("c140", torch.tensor(140.0 * self.scale).round().long())
+
+    def mul_fixed(self, a, b):
+        return (a * b).round().long() >> self.f_bits
+
+    def forward(self, x: torch.Tensor) -> None:
+        x_fixed = (x * self.scale).round().long()
+
+        self.v = torch.where(self.s, self.c, self.v)
+        self.u = torch.where(self.s, self.u + self.d, self.u)
+
+        if self.s.any():
+            input_spikes = (torch.cat(
+                [self.S[:, self.s[i]].sum(dim=1)[None] for i in range(self.s.shape[0])],
+                dim=0,
+            ) * self.scale).round().long()
+            x_fixed += input_spikes
+
+
+        for _ in range(2):
+            v_sq = self.mul_fixed(self.v, self.v)
+            v5 = self.mul_fixed(self.c5, self.v)
+            v_sq004 = self.mul_fixed(self.c004, v_sq)
+            
+            dv = (v_sq004 + v5 + self.c140 - self.u + x_fixed) >> 1
+            self.v += self.mul_fixed(self.dt_fixed, dv)
+
+        du = self.mul_fixed(self.a, self.mul_fixed(self.b, self.v) - self.u)
+        self.u += self.mul_fixed(self.dt_fixed, du)
+
+        if self.lbound is not None:
+            self.v.masked_fill_(self.v < self.lbound, self.lbound)
+
+        self.s = self.v >= self.thresh
+        super().forward(x)
+    def reset_state_variables(self) -> None:
+        # language=rst
+        """
+        Resets relevant state variables.
+        """
+        super().reset_state_variables()
+        self.v.fill_(self.rest)  # Neuron voltages.
+        self.u = self.mul_fixed(self.b, self.v)  # Neuron recovery.
+
+    def set_batch_size(self, batch_size) -> None:
+        # language=rst
+        """
+        Sets mini-batch size. Called when layer is added to a network.
+
+        :param batch_size: Mini-batch size.
+        """
+        super().set_batch_size(batch_size=batch_size)
+        # Sử dụng self.v.device để đảm bảo tensor mới nằm cùng thiết bị (CPU/GPU)
+        self.v = (self.rest * torch.ones(batch_size, *self.shape, device=self.v.device)).long()
+        self.u = self.mul_fixed(self.b, self.v)
+
+class IzhikevichIBNodes(Nodes):
+    # language=rst
+    """
+    Layer of `Izhikevich neurons<https://www.izhikevich.org/publications/spikes.htm>`_.
+    """
+
+    def __init__(
+        self,
+        n: Optional[int] = None,
+        shape: Optional[Iterable[int]] = None,
+        traces: bool = False,
+        traces_additive: bool = False,
+        tc_trace: Union[float, torch.Tensor] = 20.0,
+        trace_scale: Union[float, torch.Tensor] = 1.0,
+        sum_input: bool = False,
+        excitatory: float = 1,
+        thresh: Union[float, torch.Tensor] = 45.0,
+        rest: Union[float, torch.Tensor] = -65.0,
+        lbound: float = None,
+        **kwargs,
+    ) -> None:
+        # language=rst
+        """
+        Instantiates a layer of Izhikevich neurons.
+
+        :param n: The number of neurons in the layer.
+        :param shape: The dimensionality of the layer.
+        :param traces: Whether to record spike traces.
+        :param traces_additive: Whether to record spike traces additively.
+        :param tc_trace: Time constant of spike trace decay.
+        :param trace_scale: Scaling factor for spike trace.
+        :param sum_input: Whether to sum all inputs.
+        :param excitatory: Percent of excitatory (vs. inhibitory) neurons in the layer; in range ``[0, 1]``.
+        :param thresh: Spike threshold voltage.
+        :param rest: Resting membrane voltage.
+        :param lbound: Lower bound of the voltage.
+        """
+        super().__init__(
+            n=n,
+            shape=shape,
+            traces=traces,
+            traces_additive=traces_additive,
+            tc_trace=tc_trace,
+            trace_scale=trace_scale,
+            sum_input=sum_input,
+        )
+
+        self.register_buffer("rest", torch.tensor(rest))  # Rest voltage.
+        self.register_buffer("thresh", torch.tensor(thresh))  # Spike threshold voltage.
+        self.lbound = lbound
+
+        self.register_buffer("r", None)
+        self.register_buffer("a", None)
+        self.register_buffer("b", None)
+        self.register_buffer("c", None)
+        self.register_buffer("d", None)
+        self.register_buffer("S", None)
+        self.register_buffer("excitatory", None)
+
+        if excitatory > 1:
+            excitatory = 1
+        elif excitatory < 0:
+            excitatory = 0
+
+        if excitatory == 1:
+            self.r = torch.rand(n)
+            self.a = 0.02 * torch.ones(n)
+            self.b = 0.2 * torch.ones(n)
+            self.c = -55.0 * torch.ones(n)
+            self.d = 4 * torch.ones(n)
+            self.S = 0.5 * torch.rand(n, n)
+            self.excitatory = torch.ones(n).byte()
+
+        elif excitatory == 0:
+            self.r = torch.rand(n)
+            self.a = 0.02 * torch.ones(n)
+            self.b = 0.2 * torch.ones(n)
+            self.c = -55.0 * torch.ones(n)
+            self.d = 4 * torch.ones(n)
+            self.S = -torch.rand(n, n)
+
+            self.excitatory = torch.zeros(n).byte()
+
+        else:
+            self.excitatory = torch.zeros(n).byte()
+
+            ex = int(n * excitatory)
+            inh = n - ex
+
+            # init
+            self.r = torch.zeros(n)
+            self.a = torch.zeros(n)
+            self.b = torch.zeros(n)
+            self.c = torch.zeros(n)
+            self.d = torch.zeros(n)
+            self.S = torch.zeros(n, n)
+
+            # excitatory
+            self.r[:ex] = torch.rand(ex)
+            self.a[:ex] = 0.02 * torch.ones(ex)
+            self.b[:ex] = 0.2 * torch.ones(ex)
+            self.c[:ex] = -65.0 * torch.ones(ex)
+            self.d[:ex] = 8 * torch.ones(ex)
+            self.S[:, :ex] = 0.5 * torch.rand(n, ex)
+            self.excitatory[:ex] = 1
+
+            # inhibitory
+            self.r[ex:] = torch.rand(inh)
+            self.a[ex:] = 0.02 * torch.ones(inh)
+            self.b[ex:] = 0.2 * torch.ones(inh)
+            self.c[ex:] = -65.0 * torch.ones(inh)
+            self.d[ex:] = 8 * torch.ones(inh)
+            self.S[:, ex:] = -torch.rand(n, inh)
+            self.excitatory[ex:] = 0
+
+        self.register_buffer("v", self.rest * torch.ones(n))  # Neuron voltages.
+        self.register_buffer("u", self.b * self.v)  # Neuron recovery.
+
+    def forward(self, x: torch.Tensor) -> None:
+        # language=rst
+        """
+        Runs a single simulation step.
+
+        :param x: Inputs to the layer.
+        """
+
+        # Voltage and recovery reset.
+        self.v = torch.where(self.s, self.c, self.v)
+        self.u = torch.where(self.s, self.u + self.d, self.u)
+
+        # Add inter-columnar input.
+        if self.s.any():
+            x += torch.cat(
+                [self.S[:, self.s[i]].sum(dim=1)[None] for i in range(self.s.shape[0])],
+                dim=0,
+            )
+
+        # Apply v and u updates.
+        self.v += self.dt * 0.5 * (0.04 * self.v**2 + 5 * self.v + 140 - self.u + x)
+        self.v += self.dt * 0.5 * (0.04 * self.v**2 + 5 * self.v + 140 - self.u + x)
+        self.u += self.dt * self.a * (self.b * self.v - self.u)
+
+        # Voltage clipping to lower bound.
+        if self.lbound is not None:
+            self.v.masked_fill_(self.v < self.lbound, self.lbound)
+
+        # Check for spiking neurons.
+        self.s = self.v >= self.thresh
+
+        super().forward(x)
+
+    def reset_state_variables(self) -> None:
+        # language=rst
+        """
+        Resets relevant state variables.
+        """
+        super().reset_state_variables()
+        self.v.fill_(self.rest)  # Neuron voltages.
+        self.u = self.b * self.v  # Neuron recovery.
+
+    def set_batch_size(self, batch_size) -> None:
+        # language=rst
+        """
+        Sets mini-batch size. Called when layer is added to a network.
+
+        :param batch_size: Mini-batch size.
+        """
+        super().set_batch_size(batch_size=batch_size)
+        self.v = self.rest * torch.ones(batch_size, *self.shape, device=self.v.device)
+        self.u = self.b * self.v
 
 # toideptraivlcsadsađâ
